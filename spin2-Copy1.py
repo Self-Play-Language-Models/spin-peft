@@ -15,8 +15,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft.tuners.lora import LoraConfig, LoraModel
 from peft import get_peft_model
 from datasets import load_dataset
-from transformers import Trainer, TrainingArguments
-
+from transformers import Trainer, TrainingArguments, DataCollatorForLanguageModeling
+from trl import SFTTrainer
 
 # Load model and tokenizer
 
@@ -78,14 +78,11 @@ ds = ds.map(preprocess, remove_columns=["messages", "prompt_id"])
 
 
 # In[95]:
-
-
 dataset = ds
 
 def group_batch(batch):
     return {k: [v] for k, v in batch.items()}
-dataset = dataset.map(group_batch, batched=True, batch_size=2)
-
+#dataset = dataset.map(group_batch, batched=True, batch_size=2
 
 # Define LoRA configuration
 
@@ -168,14 +165,14 @@ for iteration in range(T):
     peft_model.disable_adapter_layers()
     
     synthetic_data = []
-    for data in tqdm(dataset):
-        prompt = data['prompt']
-        # Tokenize and generate synthetic data using the opponent model
-        prompt_ids = tokenizer(prompt, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-        with torch.no_grad():
-            peft_model.eval()  # Set model to evaluation mode
-            synthetic_response_ids = peft_model.generate(prompt_ids, max_length=50)
-            synthetic_data.append(synthetic_response_ids)
+    #for data in tqdm(dataset):
+    #    prompt = data['prompt']
+    #    # Tokenize and generate synthetic data using the opponent model
+    #    prompt_ids = tokenizer(prompt, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+    #    with torch.no_grad():
+    #       peft_model.eval()  # Set model to evaluation mode
+    #        synthetic_response_ids = peft_model.generate(prompt_ids, max_length=50)
+    #        synthetic_data.append(synthetic_response_ids)
     
     # Enable adapter layers for training the main player model
     peft_model.enable_adapter_layers()
@@ -183,10 +180,10 @@ for iteration in range(T):
     # Train the main player model using the synthetic data and real responses
     peft_model.train()  # Set model to training mode
 
-
-        
-    class SPINTrainer(Trainer):
+    class SPINTrainer(SFTTrainer):
         def compute_loss(self, peft_model, inputs, return_outputs=False):
+            print(inputs)
+            exit(0)
 
             #prompt_ids = inputs["input_ids"]
             prompt = inputs['query']
@@ -224,16 +221,25 @@ for iteration in range(T):
             #labels.float().view(-1, self.model.config.num_labels))
             return (loss, synthetic_response_ids) if return_outputs else loss
 
+        
+    args = TrainingArguments(remove_unused_columns=False, output_dir="dir")
+    collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-    args = TrainingArguments(remove_unused_columns=False, output_dir="deez")
+
+    #def tokenize_func(examples):
+    #	return tokenizer(examples["prompt"], padding=True, truncation=True)  # max_length=512,  padding=True
+
+    #encoded_dataset = dataset.map(tokenize_func)
+    print(dataset.columns)
+    #print(encoded_dataset[0])
+
     trainer = SPINTrainer(
         model=peft_model,
         train_dataset=dataset,
-        #tokenizer=tokenizer,
+        tokenizer=tokenizer,
         args = args,
-        data_collator=None
-
-
+        dataset_text_field="prompt"
+        #data_collator=collator
     )
 
     

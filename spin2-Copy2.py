@@ -9,6 +9,37 @@
 
 # In[3]:
 
+cutoff_len=1000
+def tokenize(prompt: str, add_eos_token=True):
+    # there's probably a way to do this with the tokenizer settings
+    # but again, gotta move fast
+    result = tokenizer(
+        prompt,
+        truncation=True,
+        max_length=cutoff_len,
+        padding=False,
+        return_tensors=None,
+    )
+    if (
+        result["input_ids"][-1] != tokenizer.eos_token_id
+        and len(result["input_ids"]) < cutoff_len
+        and add_eos_token
+    ):
+        result["input_ids"].append(tokenizer.eos_token_id)
+        result["attention_mask"].append(1)
+
+    result["labels"] = result["input_ids"].copy()
+
+    return result
+
+def generate_and_tokenize_prompt(data_point):
+    tokenized_full_prompt = tokenize(data_point["prompt"])
+    tokenized_full_prompt["prompt"] = data_point["prompt"]
+    tokenized_full_prompt["response"] = data_point["response"]
+    return tokenized_full_prompt
+
+dataset = dataset.map(generate_and_tokenize_prompt)
+
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
