@@ -1,109 +1,201 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[2]:
+
+
+#get_ipython().system('pip3 install datasets peft transformers accelerate trl torch bitsandbytes accelerate')
+
+
+# In[1]:
+
+
+import os
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft.tuners.lora import LoraConfig, LoraModel
+from datasets import Dataset, load_dataset
+from peft import LoraConfig, PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, TrainingArguments
+from transformers import BitsAndBytesConfig
 
-# Load model and tokenizer
-model_checkpoint = "Intel/neural-chat-7b-v1-1"
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = AutoModelForCausalLM.from_pretrained(model_checkpoint).to(device)
-tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
-tokenizer.pad_token = tokenizer.eos_token
+from trl import DPOTrainer
 
-# Define lambda regularization parameter as per paper details
-lambda_reg = 0.1
 
-# Placeholder for the dataset loading function
-dataset = [{"prompt": "Example prompt", "response": "Example response"}]
+# In[2]:
 
-# Define LoRA configuration
-lora_config = LoraConfig(
-    r=32,  # rank of LoRA
-    lora_alpha=64,  # scaling factor for initialization
-    lora_dropout=0.05,
-    bias="none",
+
+#get_ipython().system('pip3 install accelerate')
+
+
+# In[3]:
+
+
+MODEL_NAME = "alignment-handbook/zephyr-7b-sft-full"
+DATASET_NAME = "ultrachat200k"
+LR = 5e-4
+
+LORA_R = 32
+LORA_ALPHA = 16
+LORA_DROPOUT = 0.05
+
+DPO_BETA = 1
+
+
+# In[62]:
+
+
+from jinja2 import Template
+
+# preprocess the ultrachat200k dataset (or any sharegpt format ds)
+dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft[:40]")
+
+tstr = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
+template = Template(tstr)
+
+def preprocess(item):
+    output = template.render(messages=item["messages"], add_generation_prompt=True, eos_token='\n')
+    return {"prompt": item["prompt"], "response": output}
+
+dataset = dataset.map(preprocess, remove_columns=["messages", "prompt_id"])
+
+
+# In[54]:
+
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
 )
 
-# Wrap the model with LoRA layers for parameter-efficient training
-peft_model = LoraModel(model, lora_config, adapter_name="iter").to(device)
+base_model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,        # "meta-llama/Llama-2-7b-hf"
+    quantization_config=bnb_config,
+    device_map={"": 0},
+    trust_remote_code=True,
+    #use_auth_token=True,
+)
+base_model.config.use_cache = False
 
-# Define the compute_spin_loss function (unchanged from previous)
-def compute_spin_loss(model_logits_gt, opponent_logits_gt, model_logits_syn, opponent_logits_syn, lambda_reg):
+# initialize peft config
+peft_config = LoraConfig(
+    r=LORA_R,
+    lora_alpha=LORA_ALPHA,
+    lora_dropout=LORA_DROPOUT,
+    target_modules=["q_proj", "v_proj"],
+    bias="none",
+    task_type="CAUSAL_LM",
+)
 
-    # print shapes
 
-    model_probs_gt = torch.nn.functional.softmax(model_logits_gt, dim=-1)
-    model_probs_syn = torch.nn.functional.softmax(model_logits_syn, dim=-1)
-    opponent_probs_gt = torch.nn.functional.softmax(opponent_logits_gt, dim=-1)
-    opponent_probs_syn = torch.nn.functional.softmax(opponent_logits_syn, dim=-1)
+# In[70]:
 
-    # Calculate losses
-    loss_gt = -torch.log(model_probs_gt / opponent_probs_gt)
-    loss_syn = -torch.log(model_probs_syn / opponent_probs_syn)
 
-    # Apply the logistic loss to the log odds ratio
-    logistic_loss_gt = torch.log(1 + torch.exp(-lambda_reg * loss_gt))
-    logistic_loss_syn = torch.log(1 + torch.exp(-lambda_reg * loss_syn))
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, pad_token_id=tokenizer.eos_token_id, use_fast=True)
 
-    # Combine losses for the final spin loss
-    spin_loss = logistic_loss_gt.mean() + logistic_loss_syn.mean()
-    return spin_loss
 
-# Training setup
-optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, peft_model.parameters()), lr=5e-5)
+# In[73]:
 
-# Training loop for T iterations
-T = 5  # Set the number of iterations
-for iteration in range(T):
-    total_loss = 0
+
+from transformers import pipeline
+from tqdm import tqdm
+# given a model, generate a synthetic 
+def generate_data(llama_model, dataset, batch_size=1):
+    text_generator = pipeline("text-generation", model=llama_model, tokenizer=tokenizer)  # Use appropriate device index
+
+    prompts = dataset["prompt"]
+    responses = dataset["response"]
+
+    generated_prompts = []
+    generated_responses = []
+
+    for i in tqdm(range(0, len(prompts), batch_size)):
+        batch_prompts = prompts[i:i+batch_size]
+
+        print(batch_prompts)
+
+        batch_responses = text_generator(batch_prompts, max_length=512)
+
+        #batch_generated_responses = [response[0]['generated_text'] for response in batch_responses]
+        #batch_responses = prompts[i:i+batch_size]
+
+        #generated_prompts.extend(batch_prompts)
+        #generated_responses.extend(batch_generated_responses)
+
+    generated_data = pd.DataFrame({"question": generated_prompts, "response_j": batch_responses, "response_k": generated_responses})
+
+    return generated_data
+
+
+# In[74]:
+
+
+orig_dataset = generate_data(model, dataset)
+
+
+# In[46]:
+
+
+from peft import get_peft_model
+
+"""
+model = AutoPeftModelForCausalLM.from_pretrained(
+    MODEL_NAME, # location of saved SFT model
+    low_cpu_mem_usage=True,
+    torch_dtype=torch.float16,
+    load_in_4bit=True,
+    is_trainable=True,
+)
+"""
+
+
+model =  base_model
+model_peft = get_peft_model(model, peft_config)
+
+dataset = orig_dataset
+
+for i in range(SPIN_ITER):
+
+    model_peft = get_peft_model(model, peft_config)
+
+    print("Training")
+    dpo_trainer = DPOTrainer(
+        model=model_peft,
+        ref_model=None,
+        args=training_args,
+        beta=DPO_BETA,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
+        peft_config=peft_config,
+    )
+    dpo_trainer.train()
+    dpo_trainer.save_pretrained(f"peft_checkpoint_{i}")
+
+    print("Generating Data")
+
+    dataset = generate_data(peft_model, orig_dataset)
+
+    model = peft_model.unload()
     
-    # Disable adapter layers for the opponent model
-    peft_model.disable_adapter_layers()
-    
-    synthetic_data = []
-    for data in dataset:
-        prompt = data['prompt']
-        # Tokenize and generate synthetic data using the opponent model
-        prompt_ids = tokenizer(prompt, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-        with torch.no_grad():
-            peft_model.eval()  # Set model to evaluation mode
-            synthetic_response_ids = peft_model.generate(prompt_ids, max_length=50)
-            synthetic_data.append(synthetic_response_ids)
-    
-    # Enable adapter layers for training the main player model
-    peft_model.enable_adapter_layers()
-    
-    # Train the main player model using the synthetic data and real responses
-    peft_model.train()  # Set model to training mode
-    for i, data in enumerate(dataset):
-        ground_truth = data['response']
-        ground_truth_ids = tokenizer(ground_truth, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-        synthetic_response_ids = synthetic_data[i]
 
-        # Calculate logits for ground truth and synthetic responses
-        main_player_logits_gt = peft_model(ground_truth_ids).logits
-        main_player_logits_syn = peft_model(synthetic_response_ids).logits
 
-        # Get opponent's logits for synthetic responses (as they were generated before enabling LoRA)
-        with torch.no_grad():
-            opponent_logits_syn = peft_model(synthetic_response_ids).logits
-        
-        # Compute the loss (assuming the function is defined above)
-        loss = compute_spin_loss(
-            main_player_logits_gt, opponent_logits_syn, 
-            main_player_logits_syn, opponent_logits_syn, 
-            lambda_reg
-        )
-        total_loss += loss.item()
+# In[ ]:
 
-        # Backpropagation and optimization
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-    
-    # Print average loss
-    average_loss = total_loss / len(dataset)
-    print(f"Iteration {iteration + 1}/{T}, Average Loss: {average_loss}")
 
-# Save the final model parameters
-final_model_params = peft_model.state_dict()
-print("Training complete.")
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
