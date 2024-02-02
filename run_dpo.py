@@ -74,14 +74,14 @@ if __name__ == "__main__":
     training_args = TrainingArguments(
         per_device_train_batch_size=16,
         #per_device_eval_batch_size=8,
-        max_steps=5,
-        logging_steps=500,
-        save_steps=2000,
+        max_steps=2500,
+        logging_steps=1,
+        save_steps=2500,
         gradient_accumulation_steps=8,
         gradient_checkpointing=True,
-        learning_rate=3e-4,
-        evaluation_strategy="steps",
-        eval_steps=100,
+        learning_rate=3e-5,
+        #evaluation_strategy="steps",
+        #eval_steps=100,
         output_dir="spin",
         report_to="wandb",
         #lr_scheduler_type=script_args.lr_scheduler_type,
@@ -89,7 +89,7 @@ if __name__ == "__main__":
         #optim=script_args.optimizer_type,
         bf16=True,
         remove_unused_columns=False,
-        run_name="spin",
+        run_name=f"spin_{iter}",
     )
 
     model_peft = get_peft_model(base_model, peft_config)
