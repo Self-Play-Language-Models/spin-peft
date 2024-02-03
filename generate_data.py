@@ -12,9 +12,83 @@ from jinja2 import Template
 from transformers import pipeline
 from tqdm import tqdm
 import pandas as pd
+import re 
+import random
 
+
+def maybe_insert_system_message(messages, tokenizer):
+    if messages[0]["role"] == "system":
+        return
+
+    # chat template can be one of two attributes, we check in order
+    chat_template = tokenizer.chat_template
+    if chat_template is None:
+        chat_template = tokenizer.default_chat_template
+
+    # confirm the jinja template refers to a system message before inserting
+    if "system" in chat_template:
+        messages.insert(0, {"role": "system", "content": ""})
+
+
+
+def apply_chat_template(
+    example,
+    tokenizer,
+    task,
+):
+    if task in ["sft", "generation"]:
+        messages = example["messages"]
+        # We add an empty system message if there is none
+        maybe_insert_system_message(messages, tokenizer)
+        example["text"] = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True if task == "generation" else False
+        )
+        substring = "\<\|assistant\|\>"
+        random_match = random.choice([match.end() for match in re.finditer(substring, example["text"], flags=re.IGNORECASE)])
+        example["prompt"] = example["text"][:random_match]
+        example["response"] = example["text"][random_match:]
+        
+    elif task == "rm":
+        if all(k in example.keys() for k in ("chosen", "rejected")):
+            chosen_messages = example["chosen"]
+            rejected_messages = example["rejected"]
+            # We add an empty system message if there is none
+            maybe_insert_system_message(chosen_messages, tokenizer)
+            maybe_insert_system_message(rejected_messages, tokenizer)
+
+            example["text_chosen"] = tokenizer.apply_chat_template(chosen_messages, tokenize=False)
+            example["text_rejected"] = tokenizer.apply_chat_template(rejected_messages, tokenize=False)
+        else:
+            raise ValueError(
+                f"Could not format example as dialogue for `rm` task! Require `[chosen, rejected]` keys but found {list(example.keys())}"
+            )
+    elif task == "dpo":
+        if all(k in example.keys() for k in ("chosen", "rejected")):
+            # For DPO, the inputs are triples of (prompt, chosen, rejected), where `chosen` and `rejected` are the final turn of a dialogue
+            # We therefore need to extract the N-1 turns to form the prompt
+            prompt_messages = example["chosen"][:-1]
+            # Prepend a system message if the first message is not a system message
+            if example["chosen"][0]["role"] != "system":
+                prompt_messages.insert(0, {"role": "system", "content": ""})
+            # Now we extract the final turn to define chosen/rejected responses
+            chosen_messages = example["chosen"][-1:]
+            rejected_messages = example["rejected"][-1:]
+            example["text_chosen"] = tokenizer.apply_chat_template(chosen_messages, tokenize=False)
+            example["text_rejected"] = tokenizer.apply_chat_template(rejected_messages, tokenize=False)
+            example["text_prompt"] = tokenizer.apply_chat_template(prompt_messages, tokenize=False)
+        else:
+            raise ValueError(
+                f"Could not format example as dialogue for `dpo` task! Require `[chosen, rejected]` keys but found {list(example.keys())}"
+            )
+    else:
+        raise ValueError(
+            f"Task {task} not supported, please ensure that the provided task is one of {['sft', 'generation', 'rm', 'dpo']}"
+        )
+    return example
+
+    
 # given a model, generate a synthetic 
-def generate_data(model, dataset, tokenizer, batch_size=8):
+def generate_data(model, dataset, tokenizer, batch_size=16):
     #text_generator = pipeline("text-generation", model=llama_model, tokenizer=tokenizer)  # Use appropriate device index
 
     prompts = dataset["prompt"]
@@ -30,7 +104,7 @@ def generate_data(model, dataset, tokenizer, batch_size=8):
         encoding = tokenizer(batch_prompts, padding=True, return_tensors='pt').to('cuda:0')
         
         with torch.no_grad():
-            generated_ids = model.generate(**encoding)
+            generated_ids = model.generate(**encoding, max_length=1024)
         generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
         batch_generated_responses = generated_texts
@@ -65,7 +139,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     iter = args.iter
-    
     # initialize the base model
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -82,7 +155,7 @@ if __name__ == "__main__":
     )
     base_model.config.use_cache = False
 
-    if iter != 10:
+    if iter != 0:
         # initialize peft config
         peft_config = LoraConfig(
             r=LORA_R,
@@ -101,16 +174,14 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     
     # preprocess the ultrachat200k dataset (or any sharegpt format ds)
-    dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft")
+    dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft[:5000]")
     
-    tstr = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
-    template = Template(tstr)
-    
-    def preprocess(item):
-        output = template.render(messages=item["messages"], add_generation_prompt=True, eos_token='\n')
-        return {"prompt": item["prompt"], "response": output}
-    
-    dataset = dataset.map(preprocess, remove_columns=["messages", "prompt_id"])
+    dataset = dataset.map(
+        apply_chat_template,
+        fn_kwargs={"tokenizer": tokenizer, "task": "sft"},
+        num_proc=16,
+        desc="Formatting comparisons with prompt template")
+    #dataset = dataset.map(apply_chat_template, remove_columns=["messages", "prompt_id"])
     orig_dataset = generate_data(base_model, dataset, tokenizer)
 
     print(orig_dataset)

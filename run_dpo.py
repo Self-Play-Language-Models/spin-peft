@@ -74,10 +74,10 @@ if __name__ == "__main__":
     training_args = TrainingArguments(
         per_device_train_batch_size=16,
         #per_device_eval_batch_size=8,
-        max_steps=2500,
+        max_steps=1250,
         logging_steps=1,
         save_steps=2500,
-        gradient_accumulation_steps=8,
+        gradient_accumulation_steps=1,
         gradient_checkpointing=True,
         learning_rate=3e-5,
         #evaluation_strategy="steps",
@@ -94,7 +94,6 @@ if __name__ == "__main__":
 
     model_peft = get_peft_model(base_model, peft_config)
 
-    print("Training")
     dpo_trainer = DPOTrainer(
         model=model_peft,
         ref_model=None,
