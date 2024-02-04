@@ -88,7 +88,7 @@ def apply_chat_template(
 
     
 # given a model, generate a synthetic 
-def generate_data(model, dataset, tokenizer, batch_size=16):
+def generate_data(model, dataset, tokenizer, batch_size=8):
     #text_generator = pipeline("text-generation", model=llama_model, tokenizer=tokenizer)  # Use appropriate device index
 
     prompts = dataset["prompt"]

@@ -51,7 +51,7 @@ if __name__ == "__main__":
         trust_remote_code=True,
         #use_auth_token=True,
     )
-    base_model.config.use_cache = False
+    #base_model.config.use_cache = False
     
     # initialize peft config
     peft_config = LoraConfig(
@@ -79,7 +79,7 @@ if __name__ == "__main__":
         save_steps=2500,
         gradient_accumulation_steps=1,
         gradient_checkpointing=True,
-        learning_rate=3e-5,
+        learning_rate=3e-6,
         #evaluation_strategy="steps",
         #eval_steps=100,
         output_dir="spin",
@@ -92,7 +92,10 @@ if __name__ == "__main__":
         run_name=f"spin_{iter}",
     )
 
-    model_peft = get_peft_model(base_model, peft_config)
+    model_peft = get_peft_model(
+        base_model,         
+        peft_config
+        )
 
     dpo_trainer = DPOTrainer(
         model=model_peft,
